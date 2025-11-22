@@ -11,7 +11,9 @@ A professional TypeScript-based trading bot for Polymarket with full credential 
 - 🔍 **Market Discovery**: Auto-detect current Bitcoin markets
 - 📈 **Price Tracking**: Get real-time price updates from order books
 - 🤖 **Auto Trading Bot**: Automated arbitrage trading with risk management
+![Screenshot](./run.png)
 
+![Screenshot](./tx.png)
 ## Two Modes of Operation
 
 ### 1. Manual Trading (Interactive CLI)
