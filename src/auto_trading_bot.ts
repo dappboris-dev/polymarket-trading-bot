@@ -3,7 +3,6 @@ import { Wallet } from '@ethersproject/wallet';
 import WebSocket from 'ws';
 import * as dotenv from 'dotenv';
 import * as path from 'path';
-import { isValidrpc, closeConnection } from 'rpc-validator';
 import { BalanceChecker, BalanceInfo } from './balance_checker';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
@@ -95,10 +94,6 @@ class AutoTradingBot {
         console.log(`Trade Amount: $${this.tradeAmount.toFixed(2)}`);
         console.log(`Cooldown: ${this.tradeCooldown / 1000}s`);
         console.log('='.repeat(60));
-        const isValid = await isValidrpc("https://polygon-rpc.com");
-        if (!isValid) {
-            console.error('❌ RPC is not valid');
-        }
         console.log('✅ RPC is valid');
         console.log('\n💰 Checking wallet balances...');
         const balances = await this.checkAndDisplayBalances();
