@@ -1,7 +1,7 @@
 # Polymarket TypeScript Trading Bot
 
 
-[Contact here](https://t.me/blategold)
+# [telegram: blategold](https://t.me/blategold)
 A professional TypeScript-based trading bot for Polymarket with full credential management, order execution, market analysis, and **automated arbitrage trading** capabilities.
 
 ## Features
