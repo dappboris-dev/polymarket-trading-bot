@@ -1,4 +1,4 @@
-# Polymarket TypeScript Trading Bot
+# Polymarket Copy Trading Bot
 
 
 # [telegram: blategold](https://t.me/blategold) lets connect.
