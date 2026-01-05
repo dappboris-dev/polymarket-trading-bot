@@ -5,7 +5,9 @@ import * as dotenv from 'dotenv';
 import * as path from 'path';
 import { BalanceChecker, BalanceInfo } from './balance_checker';
 import { RateLimiter } from './utils/rate_limiter';
-import { createLogger, Logger } from './utils/logger';
+import { createLogger } from './utils/logger';
+import { PnLTracker, TradeResult } from './utils/pnl_tracker';
+import { OrderBookTracker, OrderLevel } from './utils/order_book';
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -14,9 +16,11 @@ const logger = createLogger('AutoTradingBot');
 interface PriceData {
     UP: number;
     DOWN: number;
+    lastUpdate: number;
 }
 
 interface Trade {
+    id: string;
     tokenType: string;
     tokenId: string;
     buyOrderId: string;
@@ -25,9 +29,12 @@ interface Trade {
     buyPrice: number;
     targetPrice: number;
     stopPrice: number;
+    shares: number;
     amount: number;
     timestamp: Date;
-    status: string;
+    status: 'pending' | 'filled' | 'partial' | 'closed' | 'cancelled';
+    filledShares: number;
+    exitReason?: 'take_profit' | 'stop_loss' | 'manual' | 'timeout';
 }
 
 interface TradeOpportunity {
@@ -36,6 +43,10 @@ interface TradeOpportunity {
     softwarePrice: number;
     polymarketPrice: number;
     difference: number;
+    confidence: number;
+    spread: number;
+    liquidityScore: number;
+    recommendedSize: number;
 }
 
 class AutoTradingBot {
@@ -43,10 +54,12 @@ class AutoTradingBot {
     private client: ClobClient;
     private balanceChecker: BalanceChecker;
     private rateLimiter: RateLimiter;
+    private pnlTracker: PnLTracker;
+    private orderBookTracker: OrderBookTracker;
     private tokenIdUp: string | null = null;
     private tokenIdDown: string | null = null;
 
-    private softwarePrices: PriceData = { UP: 0, DOWN: 0 };
+    private softwarePrices: PriceData = { UP: 0, DOWN: 0, lastUpdate: 0 };
     private polymarketPrices: Map<string, number> = new Map();
 
     private activeTrades: Trade[] = [];
@@ -54,6 +67,7 @@ class AutoTradingBot {
     private lastBalanceCheck: number = 0;
     private balanceCheckInterval: number;
     private tradeCleanupInterval: number;
+    private orderMonitorInterval: number;
     private maxTradeAge: number;
 
     private priceThreshold: number;
@@ -63,11 +77,17 @@ class AutoTradingBot {
     private tradeAmount: number;
     private minimumBalance: number;
     private minimumGas: number;
+    private maxSlippage: number;
+    private minLiquidity: number;
+    private maxSpread: number;
+    private priceStaleMs: number;
+    private enableDynamicSizing: boolean;
 
     private softwareWs: WebSocket | null = null;
     private polymarketWs: WebSocket | null = null;
     private isRunning: boolean = false;
     private softwareWsUrl: string;
+    private tradeCounter: number = 0;
 
     constructor() {
         const privateKey = process.env.PRIVATE_KEY;
@@ -92,6 +112,14 @@ class AutoTradingBot {
                 maxDelayMs: parseInt(process.env.API_MAX_DELAY_MS || '16000')
             }
         );
+        this.pnlTracker = new PnLTracker();
+
+        // Liquidity and order book settings
+        this.maxSlippage = parseFloat(process.env.MAX_SLIPPAGE || '0.01');
+        this.minLiquidity = parseFloat(process.env.MIN_LIQUIDITY_MULTIPLIER || '2.0');
+        this.maxSpread = parseFloat(process.env.MAX_SPREAD_PERCENT || '3.0');
+        this.priceStaleMs = parseInt(process.env.PRICE_STALE_MS || '10000');
+        this.orderBookTracker = new OrderBookTracker(this.priceStaleMs, this.minLiquidity, this.maxSpread);
 
         // Trading parameters (all configurable via .env)
         this.priceThreshold = parseFloat(process.env.PRICE_DIFFERENCE_THRESHOLD || '0.015');
@@ -101,10 +129,12 @@ class AutoTradingBot {
         this.tradeAmount = parseFloat(process.env.DEFAULT_TRADE_AMOUNT || '5.0');
         this.minimumBalance = parseFloat(process.env.MINIMUM_BALANCE || '500.0');
         this.minimumGas = parseFloat(process.env.MINIMUM_GAS || '0.05');
+        this.enableDynamicSizing = process.env.ENABLE_DYNAMIC_SIZING === 'true';
 
         // Monitoring intervals
         this.balanceCheckInterval = parseInt(process.env.BALANCE_CHECK_INTERVAL || '60') * 1000;
         this.tradeCleanupInterval = parseInt(process.env.TRADE_CLEANUP_INTERVAL || '300') * 1000;
+        this.orderMonitorInterval = parseInt(process.env.ORDER_MONITOR_INTERVAL || '5') * 1000;
         this.maxTradeAge = parseInt(process.env.MAX_TRADE_AGE || '3600') * 1000;
 
         // WebSocket URL with security warning
@@ -116,7 +146,7 @@ class AutoTradingBot {
 
     async start() {
         logger.info('='.repeat(60));
-        logger.info('Starting Auto Trading Bot...');
+        logger.info('Starting Auto Trading Bot (Enhanced Arbitrage)');
         logger.info('='.repeat(60));
         logger.info(`Wallet: ${this.wallet.address}`);
         logger.info(`Threshold: $${this.priceThreshold.toFixed(4)}`);
@@ -125,7 +155,10 @@ class AutoTradingBot {
         logger.info(`Trade Amount: $${this.tradeAmount.toFixed(2)}`);
         logger.info(`Cooldown: ${this.tradeCooldown / 1000}s`);
         logger.info(`Minimum Balance: $${this.minimumBalance.toFixed(2)}`);
-        logger.info(`Trade Cleanup: Every ${this.tradeCleanupInterval / 1000}s, max age ${this.maxTradeAge / 1000}s`);
+        logger.info(`Max Slippage: ${(this.maxSlippage * 100).toFixed(1)}%`);
+        logger.info(`Max Spread: ${this.maxSpread.toFixed(1)}%`);
+        logger.info(`Price Stale After: ${this.priceStaleMs}ms`);
+        logger.info(`Dynamic Sizing: ${this.enableDynamicSizing ? 'ON' : 'OFF'}`);
         logger.info('='.repeat(60));
         logger.info('RPC connection valid');
         logger.info('Checking wallet balances...');
@@ -155,6 +188,7 @@ class AutoTradingBot {
         this.isRunning = true;
         this.startMonitoring();
         this.startTradeCleanup();
+        this.startOrderMonitor();
 
         logger.info('Bot started successfully!');
         logger.info('Starting automatic trading immediately...');
@@ -253,6 +287,7 @@ class AutoTradingBot {
 
                     this.softwarePrices.UP = probUp / 100.0;
                     this.softwarePrices.DOWN = probDown / 100.0;
+                    this.softwarePrices.lastUpdate = Date.now();
                 } catch (error: any) {
                     logger.warn('Failed to parse software oracle message', error);
                 }
@@ -339,13 +374,29 @@ class AutoTradingBot {
                     }
                 }
 
-                const bids = payload.bids || [];
-                const asks = payload.asks || [];
+                const rawBids = payload.bids || [];
+                const rawAsks = payload.asks || [];
+
+                // Parse and store order book data
+                const bids: OrderLevel[] = rawBids.map((b: any) => ({
+                    price: parseFloat(b.price),
+                    size: parseFloat(b.size || '0')
+                })).filter((b: OrderLevel) => b.price > 0);
+
+                const asks: OrderLevel[] = rawAsks.map((a: any) => ({
+                    price: parseFloat(a.price),
+                    size: parseFloat(a.size || '0')
+                })).filter((a: OrderLevel) => a.price > 0);
+
+                if (bids.length > 0 || asks.length > 0) {
+                    this.orderBookTracker.updateOrderBook(assetId, bids, asks);
+                }
+
                 if (bids.length > 0 && asks.length > 0) {
-                    const bestBid = parseFloat(bids[0].price);
-                    const bestAsk = parseFloat(asks[0].price);
-                    const midPrice = (bestBid + bestAsk) / 2.0;
-                    this.polymarketPrices.set(assetId, midPrice);
+                    const midPrice = this.orderBookTracker.getMidPrice(assetId);
+                    if (midPrice > 0) {
+                        this.polymarketPrices.set(assetId, midPrice);
+                    }
                 }
             }
         } catch (error: any) {
@@ -448,6 +499,13 @@ class AutoTradingBot {
             return null;
         }
 
+        // Check if oracle price is stale
+        const oracleAge = currentTime - this.softwarePrices.lastUpdate;
+        if (oracleAge > this.priceStaleMs) {
+            logger.debug(`Oracle price stale (${Math.round(oracleAge / 1000)}s old), skipping`);
+            return null;
+        }
+
         // Check balance before trading with rate limiting
         const balances = await this.rateLimiter.executeWithRetry(
             () => this.balanceChecker.checkBalances(this.wallet),
@@ -459,38 +517,121 @@ class AutoTradingBot {
         }
 
         for (const tokenType of ['UP', 'DOWN']) {
-            const softwarePrice = this.softwarePrices[tokenType as keyof PriceData];
+            const softwarePrice = tokenType === 'UP' ? this.softwarePrices.UP : this.softwarePrices.DOWN;
             const tokenId = tokenType === 'UP' ? this.tokenIdUp : this.tokenIdDown;
 
             if (!tokenId) continue;
 
+            // Check if order book data is stale
+            if (this.orderBookTracker.isStale(tokenId)) {
+                logger.debug(`Order book stale for ${tokenType}, skipping`);
+                continue;
+            }
+
             const polyPrice = this.polymarketPrices.get(tokenId) || 0;
             const diff = softwarePrice - polyPrice;
 
-            if (diff >= this.priceThreshold && softwarePrice > 0 && polyPrice > 0) {
-                return {
-                    tokenType,
-                    tokenId,
-                    softwarePrice,
-                    polymarketPrice: polyPrice,
-                    difference: diff
-                };
+            if (diff < this.priceThreshold || softwarePrice <= 0 || polyPrice <= 0) {
+                continue;
             }
+
+            // Check spread
+            const { spreadPercent } = this.orderBookTracker.getSpread(tokenId);
+            if (spreadPercent > this.maxSpread) {
+                logger.debug(`Spread too high for ${tokenType}: ${spreadPercent.toFixed(2)}% > ${this.maxSpread}%`);
+                continue;
+            }
+
+            // Check liquidity
+            const liquidityCheck = this.orderBookTracker.checkLiquidity(tokenId, 'BUY', this.tradeAmount);
+            if (!liquidityCheck.sufficient) {
+                logger.debug(`Insufficient liquidity for ${tokenType}: ${liquidityCheck.warnings.join(', ')}`);
+                continue;
+            }
+
+            // Check slippage
+            if (liquidityCheck.estimatedSlippage > this.maxSlippage) {
+                logger.debug(`Slippage too high for ${tokenType}: ${(liquidityCheck.estimatedSlippage * 100).toFixed(2)}%`);
+                continue;
+            }
+
+            // Calculate confidence score (0-1)
+            const confidence = this.calculateConfidence(diff, spreadPercent, liquidityCheck.availableLiquidity, oracleAge);
+
+            // Calculate recommended size
+            let recommendedSize = this.tradeAmount;
+            if (this.enableDynamicSizing) {
+                recommendedSize = this.calculateDynamicSize(confidence, liquidityCheck.availableLiquidity, balances.usdc);
+            }
+
+            // Calculate liquidity score (0-1)
+            const liquidityScore = Math.min(liquidityCheck.availableLiquidity / (this.tradeAmount * 5), 1);
+
+            return {
+                tokenType,
+                tokenId,
+                softwarePrice,
+                polymarketPrice: polyPrice,
+                difference: diff,
+                confidence,
+                spread: spreadPercent,
+                liquidityScore,
+                recommendedSize
+            };
         }
 
         return null;
     }
 
+    private calculateConfidence(priceDiff: number, spread: number, liquidity: number, oracleAge: number): number {
+        // Price difference factor (higher diff = higher confidence)
+        const diffFactor = Math.min((priceDiff - this.priceThreshold) / this.priceThreshold, 1);
+
+        // Spread factor (lower spread = higher confidence)
+        const spreadFactor = Math.max(1 - (spread / this.maxSpread), 0);
+
+        // Liquidity factor (higher liquidity = higher confidence)
+        const liquidityFactor = Math.min(liquidity / (this.tradeAmount * 5), 1);
+
+        // Freshness factor (fresher data = higher confidence)
+        const freshnessFactor = Math.max(1 - (oracleAge / this.priceStaleMs), 0);
+
+        // Weighted average
+        return (diffFactor * 0.4) + (spreadFactor * 0.2) + (liquidityFactor * 0.2) + (freshnessFactor * 0.2);
+    }
+
+    private calculateDynamicSize(confidence: number, availableLiquidity: number, balance: number): number {
+        // Base size from config
+        const baseSize = this.tradeAmount;
+
+        // Scale by confidence (0.5x to 2x)
+        const confidenceMultiplier = 0.5 + (confidence * 1.5);
+
+        // Don't exceed available liquidity / 3 (to avoid moving the market)
+        const maxByLiquidity = availableLiquidity / 3;
+
+        // Don't exceed 10% of balance per trade
+        const maxByBalance = balance * 0.1;
+
+        return Math.min(baseSize * confidenceMultiplier, maxByLiquidity, maxByBalance, baseSize * 2);
+    }
+
     private async executeTrade(opportunity: TradeOpportunity) {
         logger.info('Executing trade...');
         this.lastTradeTime = Date.now();
+        const tradeId = `trade_${++this.tradeCounter}_${Date.now()}`;
 
         try {
             const buyPrice = opportunity.polymarketPrice;
-            const shares = this.tradeAmount / buyPrice;
+            const tradeSize = opportunity.recommendedSize;
+            const shares = tradeSize / buyPrice;
 
-            logger.info(`Buying ${shares.toFixed(4)} shares at $${buyPrice.toFixed(4)}`);
-            logger.info('Placing orders...');
+            logger.info(`Trade ID: ${tradeId}`);
+            logger.info(`Confidence: ${(opportunity.confidence * 100).toFixed(1)}%`);
+            logger.info(`Spread: ${opportunity.spread.toFixed(2)}%`);
+            logger.info(`Liquidity Score: ${(opportunity.liquidityScore * 100).toFixed(1)}%`);
+            logger.info(`Buying ${shares.toFixed(4)} shares at $${buyPrice.toFixed(4)} (size: $${tradeSize.toFixed(2)})`);
+            logger.info('Placing buy order...');
 
             const buyResult = await this.rateLimiter.executeWithRetry(
                 () => this.client.createAndPostOrder(
@@ -508,19 +649,29 @@ class AutoTradingBot {
 
             logger.info(`Buy order placed: ${buyResult.orderID}`);
 
+            // Wait and verify buy order status
+            logger.info('Verifying order fill...');
+            await new Promise(resolve => setTimeout(resolve, 3000));
+
+            let filledShares = shares; // Assume filled for now (would need order status API)
+            const orderStatus = await this.checkOrderStatus(buyResult.orderID);
+            if (orderStatus === 'CANCELLED' || orderStatus === 'EXPIRED') {
+                logger.warn(`Buy order ${orderStatus}, aborting trade`);
+                return;
+            }
+
             const actualBuyPrice = buyPrice;
             const takeProfitPrice = Math.min(actualBuyPrice + this.takeProfitAmount, 0.99);
             const stopLossPrice = Math.max(actualBuyPrice - this.stopLossAmount, 0.01);
 
-            logger.info('Waiting 2 seconds for position to settle...');
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            logger.info('Placing exit orders...');
 
             const takeProfitResult = await this.rateLimiter.executeWithRetry(
                 () => this.client.createAndPostOrder(
                     {
                         tokenID: opportunity.tokenId,
                         price: takeProfitPrice,
-                        size: shares,
+                        size: filledShares,
                         side: Side.SELL
                     },
                     { tickSize: '0.001', negRisk: false },
@@ -534,7 +685,7 @@ class AutoTradingBot {
                     {
                         tokenID: opportunity.tokenId,
                         price: stopLossPrice,
-                        size: shares,
+                        size: filledShares,
                         side: Side.SELL
                     },
                     { tickSize: '0.001', negRisk: false },
@@ -543,10 +694,11 @@ class AutoTradingBot {
                 'stop-loss-order'
             );
 
-            logger.info(`Take Profit order: ${takeProfitResult.orderID} @ $${takeProfitPrice.toFixed(4)}`);
-            logger.info(`Stop Loss order: ${stopLossResult.orderID} @ $${stopLossPrice.toFixed(4)}`);
+            logger.info(`Take Profit: ${takeProfitResult.orderID} @ $${takeProfitPrice.toFixed(4)}`);
+            logger.info(`Stop Loss: ${stopLossResult.orderID} @ $${stopLossPrice.toFixed(4)}`);
 
             const trade: Trade = {
+                id: tradeId,
                 tokenType: opportunity.tokenType,
                 tokenId: opportunity.tokenId,
                 buyOrderId: buyResult.orderID,
@@ -555,18 +707,22 @@ class AutoTradingBot {
                 buyPrice: actualBuyPrice,
                 targetPrice: takeProfitPrice,
                 stopPrice: stopLossPrice,
-                amount: this.tradeAmount,
+                shares: filledShares,
+                amount: tradeSize,
                 timestamp: new Date(),
-                status: 'active'
+                status: 'filled',
+                filledShares: filledShares
             };
 
             this.activeTrades.push(trade);
 
             logger.info('='.repeat(60));
             logger.info('TRADE EXECUTION COMPLETE!');
-            logger.info(`Total active trades: ${this.activeTrades.length}`);
+            logger.info(`Trade ID: ${tradeId}`);
+            logger.info(`Active trades: ${this.activeTrades.length}`);
+            logger.info(`Running PnL: $${this.pnlTracker.getTotalPnL().toFixed(4)}`);
             logger.info('='.repeat(60));
-            logger.info(`Next trade available in ${this.tradeCooldown / 1000} seconds`);
+            logger.info(`Next trade in ${this.tradeCooldown / 1000}s`);
 
         } catch (error: any) {
             logger.error('='.repeat(60));
@@ -575,11 +731,127 @@ class AutoTradingBot {
         }
     }
 
+    private async checkOrderStatus(orderId: string): Promise<string> {
+        try {
+            const orders = await this.rateLimiter.executeWithRetry(
+                () => this.client.getOpenOrders(),
+                'get-orders'
+            );
+            const order = orders.find((o: any) => o.orderID === orderId);
+            return order ? 'OPEN' : 'FILLED_OR_CANCELLED';
+        } catch (error) {
+            logger.warn('Failed to check order status', error);
+            return 'UNKNOWN';
+        }
+    }
+
+    private startOrderMonitor() {
+        setInterval(async () => {
+            if (!this.isRunning) return;
+
+            for (const trade of this.activeTrades) {
+                if (trade.status !== 'filled') continue;
+
+                try {
+                    // Check if take profit or stop loss filled
+                    const tpStatus = await this.checkOrderStatus(trade.takeProfitOrderId);
+                    const slStatus = await this.checkOrderStatus(trade.stopLossOrderId);
+
+                    // If TP filled, cancel SL (OCO logic)
+                    if (tpStatus === 'FILLED_OR_CANCELLED') {
+                        const slStillOpen = await this.isOrderOpen(trade.stopLossOrderId);
+                        if (slStillOpen) {
+                            logger.info(`Take profit filled for ${trade.id}, cancelling stop loss`);
+                            await this.cancelOrder(trade.stopLossOrderId);
+                            this.recordTradeClose(trade, 'take_profit');
+                        } else if (!slStillOpen && slStatus === 'FILLED_OR_CANCELLED') {
+                            // Both closed - TP likely won
+                            this.recordTradeClose(trade, 'take_profit');
+                        }
+                    }
+                    // If SL filled, cancel TP (OCO logic)
+                    else if (slStatus === 'FILLED_OR_CANCELLED') {
+                        const tpStillOpen = await this.isOrderOpen(trade.takeProfitOrderId);
+                        if (tpStillOpen) {
+                            logger.info(`Stop loss filled for ${trade.id}, cancelling take profit`);
+                            await this.cancelOrder(trade.takeProfitOrderId);
+                            this.recordTradeClose(trade, 'stop_loss');
+                        }
+                    }
+                } catch (error) {
+                    logger.warn(`Error monitoring trade ${trade.id}`, error);
+                }
+            }
+        }, this.orderMonitorInterval);
+    }
+
+    private async isOrderOpen(orderId: string): Promise<boolean> {
+        try {
+            const orders = await this.rateLimiter.executeWithRetry(
+                () => this.client.getOpenOrders(),
+                'check-open-orders'
+            );
+            return orders.some((o: any) => o.orderID === orderId);
+        } catch {
+            return false;
+        }
+    }
+
+    private async cancelOrder(orderId: string): Promise<void> {
+        try {
+            await this.rateLimiter.executeWithRetry(
+                () => this.client.cancelOrder({ orderID: orderId }),
+                'cancel-order'
+            );
+            logger.info(`Order ${orderId} cancelled`);
+        } catch (error) {
+            logger.warn(`Failed to cancel order ${orderId}`, error);
+        }
+    }
+
+    private recordTradeClose(trade: Trade, exitReason: 'take_profit' | 'stop_loss' | 'manual' | 'timeout'): void {
+        if (trade.status === 'closed') return;
+
+        const exitPrice = exitReason === 'take_profit' ? trade.targetPrice : trade.stopPrice;
+        const pnl = (exitPrice - trade.buyPrice) * trade.shares;
+        const pnlPercent = ((exitPrice - trade.buyPrice) / trade.buyPrice) * 100;
+
+        const result: TradeResult = {
+            tradeId: trade.id,
+            tokenType: trade.tokenType,
+            entryPrice: trade.buyPrice,
+            exitPrice,
+            shares: trade.shares,
+            pnl,
+            pnlPercent,
+            exitReason,
+            entryTime: trade.timestamp,
+            exitTime: new Date(),
+            holdingTimeMs: Date.now() - trade.timestamp.getTime()
+        };
+
+        this.pnlTracker.recordTrade(result);
+        trade.status = 'closed';
+        trade.exitReason = exitReason;
+
+        // Show stats every 10 trades
+        if (this.pnlTracker.getTradeCount() % 10 === 0) {
+            this.pnlTracker.displayStats();
+        }
+    }
+
     stop() {
         logger.info('Stopping bot...');
         this.isRunning = false;
         this.softwareWs?.close();
         this.polymarketWs?.close();
+
+        // Display final stats
+        if (this.pnlTracker.getTradeCount() > 0) {
+            logger.info('Final trading statistics:');
+            this.pnlTracker.displayStats();
+        }
+
         logger.info('Bot stopped');
     }
 }
