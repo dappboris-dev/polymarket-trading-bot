@@ -1,7 +1,4 @@
-# Polymarket Copy Trading Bot
-# Donation 0xCBAcAf95cde23F6050e7EB05337Fad542B1597bE
-
-# [telegram: blategold](https://t.me/blategold) lets connect.
+# Polymarket Trading Bot
 A professional TypeScript-based trading bot for Polymarket with full credential management, order execution, market analysis, and **automated arbitrage trading** capabilities.
 
 ## Features
