@@ -1,6 +1,9 @@
 # Polymarket Trading Bot
 A professional TypeScript-based trading bot for Polymarket with full credential management, order execution, market analysis, and **automated arbitrage trading** capabilities.
 
+Dont run this demo version. it is not working. just study it for profitable bot.  If you want to have arbitrage bot. lets connect via gmail.
+This is my wallet. 
+https://polymarket.com/0xaC6014ED3F2765D8580122388E058722b52AF601?tab=positions
 ## Features
 
 - 🔐 **Credential Management**: Secure private key handling and API authentication
