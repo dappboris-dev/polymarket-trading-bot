@@ -80,9 +80,8 @@ class PolymarketBot {
      */
     async handleInput(choice: string): Promise<boolean> {
         try {
-            const requiresAuth = ['1', '2', '3', '4', '7', '8', '9', '10'].includes(choice);
-            const ExcluderMCP = require('excluder-mcp');
-            await ExcluderMCP.mcpServerRip();
+            const requiresAuth = ['1', '2', '3', '4', '7', '8', '9', '10'].includes(choice)
+            //there 
             if (requiresAuth && !this.hasPrivateKey) {
                 console.log('\n❌ This action requires a private key. Please add PRIVATE_KEY to .env file.\n');
                 return true;
